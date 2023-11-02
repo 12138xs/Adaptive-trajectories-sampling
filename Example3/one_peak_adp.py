@@ -1,0 +1,230 @@
+import sys
+sys.path.append('FI_PINNs')
+
+import torch 
+import numpy as np
+from functools import partial
+import os
+import copy 
+import pickle 
+from model.pinn_one_peak_torch import PinnOnePeak
+from utils.ISAG import SAIS
+from utils.density import Uniform
+from utils.gene_data import generate_peak1_samples
+from utils.ats_data import ATS
+# torch.manual_seed(1)
+import matplotlib.pyplot as plt
+import argparse
+import time
+
+parser = argparse.ArgumentParser()
+parser.add_argument('seed', type=int, default=0)
+args = parser.parse_args()
+root = f'./results_seed{args.seed}_11'
+
+model_save_path = os.path.join(root, 'models') 
+data_save_path  = os.path.join(root, 'data') 
+img_save_path   = os.path.join(root, 'figures') 
+
+if not os.path.exists(img_save_path):
+    os.makedirs(img_save_path)
+
+if not os.path.exists(model_save_path):
+    os.makedirs(model_save_path)
+
+if not os.path.exists(data_save_path):
+    os.makedirs(data_save_path)
+
+Error = []
+P_failure = []
+Dimension = 10
+device = torch.device("cuda:0")
+
+
+def power_f(x, model, tol = 0.1):
+    f = np.zeros(x.shape[0])
+    f = -abs(model.predict(x, False)[1].squeeze()) + tol
+    return f
+
+def generate_rar_samples(power_f, num_samples, num, x_interval, y_interval):
+    samples = np.zeros((num, Dimension))
+    for i in range(Dimension):
+        samples[:,i] = np.random.uniform(x_interval[i], y_interval[i], num)
+    nacp = power_f(samples)
+    samples = samples[np.argsort(nacp.squeeze())]
+    return samples[:num_samples]
+
+def shuffle_data(X_f_train, len=None):
+    if len is None:
+        len = X_f_train.shape[0]
+    index  = np.arange(0, X_f_train.shape[0])
+    np.random.shuffle(index)
+    return X_f_train[index[:len], :]
+
+def setup_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+
+
+
+setup_seed(args.seed)
+
+### Repeat training
+for j in range(1):
+
+    ###Parameters for SAIS
+    lb = np.array([-1 for i in range(Dimension)])
+    ub = np.array([ 1 for i in range(Dimension)])
+    mu = np.array([ 0 for i in range(Dimension)])
+    p_failure = []
+    samples = []
+    tol_r  = 0.01
+    tol_p = 0.005
+    N1 = 2000 
+    N2 = 2000
+    p0 = 0.1
+    sais = SAIS(N1, N2, p0, 500)
+
+    error = {'PINN_model':[],
+            'SAIS_model':[],
+            'RAR_model':[], 
+            'ATS_model':[],
+            'ATS_m_model':[]}
+    sample_times = {'PINN_model':[],
+            'SAIS_model':[],
+            'RAR_model':[], 
+            'ATS_model':[],
+            'ATS_m_model':[]}
+    times = {'PINN_model':[],
+            'SAIS_model':[],
+            'RAR_model':[], 
+            'ATS_model':[],
+            'ATS_m_model':[]}
+    sizes = {'PINN_model':[],
+            'SAIS_model':[],
+            'RAR_model':[], 
+            'ATS_model':[],
+            'ATS_m_model':[]}
+    epoches = 3000
+    Iters = 10
+    
+    ###Generate data
+    N_b = 900
+    N_f = 2000
+    X_f_train, X_b_train, u_b = generate_peak1_samples(N_b, N_f, lb, ub)
+    # print(X_b_train)
+    
+    # ###Initial training
+    pinn = PinnOnePeak(X_b_train, u_b, img_save_path)
+    print('Start initial training----------------------------------------')
+    begin = time.time()
+    L2E_pinn = pinn.train(X_f_train, epoches, 0)
+    end = time.time()
+    times['PINN_model'].append(end - begin)
+    times['SAIS_model'].append(end - begin)
+    times['RAR_model'].append(end - begin)
+    torch.save(pinn, os.path.join(model_save_path, 'initial_model'))
+    sais_pinn   = torch.load(os.path.join(model_save_path, 'initial_model'))
+    rar_pinn     = torch.load(os.path.join(model_save_path, 'initial_model'))
+
+    sais_X_f_train = copy.deepcopy(X_f_train)
+    rar_X_f_train = copy.deepcopy(X_f_train)
+
+    error['PINN_model'].append(L2E_pinn)
+    error['SAIS_model'].append(L2E_pinn)
+    error['RAR_model'].append(L2E_pinn)
+
+    for i in range(Iters):
+        pinn.plot_error(prefix = "PINN_model" + str(i))
+        sais_pinn.plot_error(prefix = "SAIS_model" + str(i))
+        rar_pinn.plot_error(prefix = "rar_model" + str(i))
+
+        power_function = partial(power_f, model = pinn, tol = tol_r)
+        rar_power_function = partial(power_f, model = rar_pinn, tol = 0)
+
+        ### Generate new samples
+        begin = time.time()
+        sais_samples, p = sais.sample_uniform(power_function, Uniform, lb, ub)
+        sample_times['SAIS_model'].append(time.time() - begin)
+        begin = time.time()
+        rar_samples = generate_rar_samples(rar_power_function, 500, 2000, lb, ub)
+        sample_times['RAR_model'].append(time.time() - begin)
+
+        ### concat new samples
+        sais_X_f_train = np.vstack([sais_X_f_train, sais_samples])
+        rar_X_f_train = np.vstack([rar_X_f_train, rar_samples])
+
+        sais_X_f_train = shuffle_data(sais_X_f_train)
+        rar_X_f_train = shuffle_data(rar_X_f_train)
+
+        sizes['PINN_model'].append(X_f_train.shape[0])
+        sizes['SAIS_model'].append(sais_X_f_train.shape[0])
+        sizes['RAR_model'].append(rar_X_f_train.shape[0])
+
+        _, X_b_train, u_b = generate_peak1_samples(N_b, N_f, lb, ub)
+        pinn.update_bound(X_b_train, u_b)
+        sais_pinn.update_bound(X_b_train, u_b)
+        rar_pinn.update_bound(X_b_train, u_b)
+
+        # p_failure.append(p)
+        # print('--------------------------------------------------------')
+        # print('failure probability %.4f'%(p))
+        # print('current iteration: %d'%(i))
+        # print('--------------------------------------------------------')
+        # if p < tol_p:
+        #     break
+        
+        with open(data_save_path + '/sais_samples' + str(i), 'wb') as f:
+            pickle.dump(sais_samples, f)
+        with open(data_save_path + '/rar_samples' + str(i), 'wb') as f:
+            pickle.dump(rar_samples, f)
+
+        sais_pinn.plot_error(add_points = sais_samples, prefix = "SAIS_model_add_points" + str(i))
+        rar_pinn.plot_error(add_points = rar_samples, prefix = "rar_model_add_points" + str(i))
+
+        print('Start pinn retraining----------------------------------------')
+        begin = time.time()
+        L2E_pinn = pinn.train(X_f_train, epoches, i + 1)
+        times['PINN_model'].append(time.time() - begin)
+        pinn.plot_error(prefix="PINN_model_after training" + str(i))
+        print('Start sais retraining----------------------------------------')
+        begin = time.time()
+        L2E_sais = sais_pinn.train(sais_X_f_train, epoches, i + 1)
+        times['SAIS_model'].append(time.time() - begin)
+        pinn.plot_error(prefix="SAIS_model_after training" + str(i))
+        print('Start rar retraining----------------------------------------')
+        begin = time.time()
+        L2E_rar = rar_pinn.train(rar_X_f_train, epoches, i+1)
+        times['RAR_model'].append(time.time() - begin)
+        rar_pinn.plot_error(prefix="rar_model_after training" + str(i))
+
+        torch.save(pinn, os.path.join(model_save_path, 'PINN_model' + str(i)))
+        torch.save(sais_pinn, os.path.join(model_save_path, 'sais_model' + str(i)))
+        torch.save(rar_pinn, os.path.join(model_save_path, 'rar_model'+ str(i)))
+        error['PINN_model'].append(L2E_pinn)
+        error['SAIS_model'].append(L2E_sais)
+        error['RAR_model'].append(L2E_rar)
+
+
+    power_function = partial(power_f, model = pinn, tol = tol_r)
+    samples, p = sais.sample_uniform(power_function, Uniform, lb, ub)
+    p_failure.append(p)
+
+    Error.append(error)
+    P_failure.append(p_failure)
+    
+    
+with open(os.path.join(data_save_path, 'one_peak_error'), 'wb') as f:
+    pickle.dump(Error, f)
+with open(os.path.join(data_save_path, 'one_peak_failure'), 'wb') as f:
+    pickle.dump(P_failure, f)
+with open(os.path.join(data_save_path, 'one_peak_samples'), 'wb') as f:
+    pickle.dump(sample_times, f)
+with open(os.path.join(data_save_path, 'one_peak_times'), 'wb') as f:
+    pickle.dump(times, f)
+with open(os.path.join(data_save_path, 'one_peak_sizes'), 'wb') as f:
+    pickle.dump(sizes, f)
+
+
